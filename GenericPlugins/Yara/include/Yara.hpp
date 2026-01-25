@@ -100,7 +100,7 @@ class YaraDialog : public Window, public Handlers::OnButtonPressedInterface
     void AddRecentRules();
     void RemoveRuleFile();
     void UpdateRulesListView();
-    void LoadRulesFromFolder(const std::filesystem::path& folderPath, std::vector<std::string>& errors);
+    void LoadRulesFromFolder(const std::filesystem::path& folderPath);
 
     // === Recently used persistence ===
     void RestoreRecentlyUsed();

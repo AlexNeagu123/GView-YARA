@@ -233,44 +233,23 @@ bool YaraDialog::OnEvent(Reference<Control> control, Event eventType, int id)
 
 // === Rule Management ===
 
-void YaraDialog::LoadRulesFromFolder(const std::filesystem::path& folderPath, std::vector<std::string>& errors)
+void YaraDialog::LoadRulesFromFolder(const std::filesystem::path& folderPath)
 {
-    // Recursively find all .yar/.yara files
     std::vector<std::filesystem::path> foundRuleFiles;
 
-    try {
-        for (const auto& entry : std::filesystem::recursive_directory_iterator(folderPath)) {
-            if (entry.is_regular_file()) {
-                std::string ext = entry.path().extension().string();
-                if (ext == ".yar" || ext == ".yara") {
-                    foundRuleFiles.push_back(entry.path());
-                }
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(folderPath)) {
+        if (entry.is_regular_file()) {
+            std::string ext = entry.path().extension().string();
+            if (ext == ".yar" || ext == ".yara") {
+                foundRuleFiles.push_back(entry.path());
             }
         }
-    } catch (const std::filesystem::filesystem_error& e) {
-        errors.push_back("Error scanning directory " + folderPath.string() + ": " + std::string(e.what()));
-        return;
     }
 
     if (foundRuleFiles.empty()) {
-        return; // No files found, not an error
-    }
-
-    // Test each file for compilation
-    GView::Yara::YaraManager& yaraManager = GView::Yara::YaraManager::GetInstance();
-    if (!yaraManager.Initialize()) {
-        errors.push_back("Failed to initialize Yara engine!");
         return;
     }
 
-    auto yaraCompiler = yaraManager.GetNewCompiler();
-    for (const auto& ruleFile : foundRuleFiles) {
-        if (!yaraCompiler->AddRules(ruleFile)) {
-            errors.push_back("Failed to compile: " + ruleFile.string());
-        }
-    }
-
-    // Add successfully compiled files to the list
     for (const auto& ruleFile : foundRuleFiles) {
         bool alreadyExists = false;
         for (const auto& existingPath : ruleFiles) {
@@ -330,21 +309,9 @@ void YaraDialog::AddRuleFolder()
             return;
         }
 
-        std::vector<std::string> errors;
-        LoadRulesFromFolder(selectedPath, errors);
+        LoadRulesFromFolder(selectedPath);
 
         UpdateRulesListView();
-
-        // Report results
-        if (!errors.empty()) {
-            std::string errorMsg = "Some rule files failed to compile:\n\n";
-            for (const auto& error : errors) {
-                errorMsg += error + "\n";
-            }
-            AppCUI::Dialogs::MessageBox::ShowWarning("Yara", errorMsg);
-        } else {
-            AppCUI::Dialogs::MessageBox::ShowNotification("Yara", "Successfully added rule files from folder.");
-        }
     }
 }
 
@@ -381,8 +348,7 @@ void YaraDialog::AddRecentRules()
         }
 
         if (entry.isFolder) {
-            std::vector<std::string> errors;
-            LoadRulesFromFolder(entry.path, errors);
+            LoadRulesFromFolder(entry.path);
         } else {
             ruleFiles.push_back(entry.path);
         }
@@ -748,7 +714,13 @@ void YaraDialog::ScanWithYara()
     // Generate timestamped filename
     time_t now = time(nullptr);
     std::tm tm{};
+    
+#if defined(BUILD_FOR_OSX) || defined(__APPLE__) || defined(__linux__)
+    localtime_r(&now, &tm);
+#else
     localtime_s(&tm, &now);
+#endif
+
     char timestamp[20];
     std::strftime(timestamp, sizeof(timestamp), "%Y%m%d_%H%M%S", &tm);
     std::string csvFilename = "yara_results_" + std::string(timestamp) + ".csv";
