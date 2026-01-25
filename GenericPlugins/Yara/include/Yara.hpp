@@ -86,6 +86,7 @@ class YaraDialog : public Window, public Handlers::OnButtonPressedInterface
     std::vector<std::filesystem::path> ruleFiles;
     std::vector<RecentEntry> recentlyUsedList;
     static constexpr size_t MAX_RECENT_ENTRIES = 10;
+    bool restoredCachedRecentRules             = false;
 
   public:
     YaraDialog(Reference<GView::Object> object, ScanContext ctx, const std::filesystem::path& target);
@@ -103,10 +104,14 @@ class YaraDialog : public Window, public Handlers::OnButtonPressedInterface
 
     // === Recently used persistence ===
     void RestoreRecentlyUsed();
-    void PersistRecentlyUsed(const std::filesystem::path& path, bool isFolder);
+    void UpdateRecentlyUsed(const std::filesystem::path& path, bool isFolder);
+    void PersistRecentlyUsedToDisk();
 
     // === Scanning ===
     void ScanWithYara();
+
+    // === Custom exit for lazy persistence ===
+    void ExitDialog(bool persistRecentlyUsed = false, Dialogs::Result dialogResult = Dialogs::Result::None);
 };
 
 } // namespace GView::GenericPlugins::Yara
