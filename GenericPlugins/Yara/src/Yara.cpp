@@ -510,22 +510,25 @@ static std::string EscapeCsvField(const std::string& field)
     return escaped;
 }
 
-static std::string FormatResultsAsCsv(const ScanCallbackData& data)
+static std::string FormatResultsAsCsv(const vector<ScanCallbackData>& dataVec)
 {
     std::string csv = "File,Rule,StringID,MatchValue,Offset,Length\n";
 
-    for (const auto& match : data.matches) {
-        csv += EscapeCsvField(data.fileName) + ",";
-        csv += EscapeCsvField(match.ruleName) + ",";
-        csv += EscapeCsvField(match.stringId) + ",";
-        csv += EscapeCsvField(match.matchValue) + ",";
+    for (const auto& data : dataVec) {
+    
+        for (const auto& match : data.matches) {
+            csv += EscapeCsvField(data.fileName) + ",";
+            csv += EscapeCsvField(match.ruleName) + ",";
+            csv += EscapeCsvField(match.stringId) + ",";
+            csv += EscapeCsvField(match.matchValue) + ",";
 
-        char offsetBuf[32];
-        snprintf(offsetBuf, sizeof(offsetBuf), "0x%llX", (unsigned long long) match.offset);
-        csv += offsetBuf;
-        csv += ",";
+            char offsetBuf[32];
+            snprintf(offsetBuf, sizeof(offsetBuf), "0x%llX", (unsigned long long) match.offset);
+            csv += offsetBuf;
+            csv += ",";
 
-        csv += std::to_string(match.length) + "\n";
+            csv += std::to_string(match.length) + "\n";
+        }
     }
 
     return csv;
@@ -533,8 +536,10 @@ static std::string FormatResultsAsCsv(const ScanCallbackData& data)
 
 static int ScanCallback(void* context, int message, void* message_data, void* user_data)
 {
-    ScanCallbackData* callbackData = static_cast<ScanCallbackData*>(user_data);
-    if (!callbackData) {
+    vector<ScanCallbackData>* callbackDataVec = static_cast<vector<ScanCallbackData>*>(user_data);
+    ScanCallbackData* callbackData             = &callbackDataVec->back();
+
+    if (!callbackDataVec) {
         return CALLBACK_CONTINUE;
     }
 
@@ -600,16 +605,29 @@ void YaraDialog::ScanWithYara()
 
     auto yaraRules = yaraCompiler->GetRules();
 
-    ScanCallbackData callbackData;
-    callbackData.fileName = scanTarget.filename().string();
+    vector<ScanCallbackData> callbackDataVec;
+    GView::Yara::YaraScanner yaraScanner(yaraRules, ScanCallback, &callbackDataVec);
 
     if (context == ScanContext::SingleFile) {
-        GView::Yara::YaraScanner yaraScanner(yaraRules, ScanCallback, &callbackData);
+        ScanCallbackData callbackData;
+        callbackData.fileName = scanTarget.filename().string();
+        callbackDataVec.push_back(callbackData);
+
         yaraScanner.ScanBuffer(object->GetData().GetEntireFile());
     } else {
-        // TODO: Scan folder recursively - iterate files, scan each, collect results
-        AppCUI::Dialogs::MessageBox::ShowNotification("Yara", "Folder scanning - Not yet implemented");
-        return;
+        for (const auto& entry : std::filesystem::recursive_directory_iterator(scanTarget)) {
+            if (!entry.is_regular_file()) {
+                continue;
+            }
+
+            ScanCallbackData callbackData;
+            std::filesystem::path entryPath(entry.path().string());
+
+            callbackData.fileName = entryPath.filename().string();
+            callbackDataVec.push_back(callbackData);
+
+            yaraScanner.ScanFile(entryPath);
+        }
     }
 
     // Save all used rules to recently used only after successful scan
@@ -617,12 +635,9 @@ void YaraDialog::ScanWithYara()
         UpdateRecentlyUsed(ruleFile, false);
     }
 
-    if (callbackData.matches.empty()) {
-        AppCUI::Dialogs::MessageBox::ShowNotification("Yara", "Scan completed! No matches found.");
-        return;
-    }
+    AppCUI::Dialogs::MessageBox::ShowNotification("Yara", "Scan completed!");
 
-    std::string csv = FormatResultsAsCsv(callbackData);
+    std::string csv = FormatResultsAsCsv(callbackDataVec);
 
     // Generate timestamped filename
     time_t now = time(nullptr);

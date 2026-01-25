@@ -108,7 +108,7 @@ class YaraDialog : public Window, public Handlers::OnButtonPressedInterface
     // === Scanning ===
     void ScanWithYara();
 
-    // ===  ===
+    // === Custom exit for lazy persistence ===
     void ExitDialog(bool persistRecentlyUsed = false, Dialogs::Result dialogResult = Dialogs::Result::None);
 };
 
