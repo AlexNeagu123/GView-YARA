@@ -4,6 +4,7 @@
 #include <vector>
 #include <filesystem>
 #include <ctime>
+#include <algorithm>
 
 namespace GView::GenericPlugins::Yara
 {
@@ -99,6 +100,7 @@ class YaraDialog : public Window, public Handlers::OnButtonPressedInterface
     void AddRecentRules();
     void RemoveRuleFile();
     void UpdateRulesListView();
+    void LoadRulesFromFolder(const std::filesystem::path& folderPath);
 
     // === Recently used persistence ===
     void RestoreRecentlyUsed();
