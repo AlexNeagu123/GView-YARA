@@ -1,5 +1,7 @@
 #include "Yara.hpp"
 #include "yara.h"
+#include <nlohmann/json.hpp>
+#include <fstream>
 #undef MessageBox
 
 namespace GView::GenericPlugins::Yara
@@ -160,8 +162,6 @@ YaraDialog::YaraDialog(Reference<GView::Object> object, ScanContext ctx, const s
 {
     this->object = object;
 
-    RestoreRecentlyUsed();
-
     if (context == ScanContext::SingleFile) {
         Factory::Label::Create(this, "Scanning file:", "x:1,y:1,w:14");
         Factory::TextField::Create(this, scanTarget.u16string(), "x:16,y:1,w:62", TextFieldFlags::Readonly);
@@ -212,7 +212,7 @@ void YaraDialog::OnButtonPressed(Reference<Button> b)
         ScanWithYara();
         break;
     case CMD_BUTTON_CLOSE:
-        Exit();
+        ExitDialog(true);
         break;
     }
 }
@@ -273,6 +273,12 @@ void YaraDialog::AddRuleFolder()
 
 void YaraDialog::AddRecentRules()
 {
+    if (!restoredCachedRecentRules)
+    {
+        RestoreRecentlyUsed();
+        restoredCachedRecentRules = true;
+    }
+
     if (recentlyUsedList.empty()) {
         AppCUI::Dialogs::MessageBox::ShowNotification("Yara", "No recently used rules found.");
         return;
@@ -349,38 +355,59 @@ void YaraDialog::UpdateRulesListView()
 
 void YaraDialog::RestoreRecentlyUsed()
 {
-    // TODO: Currently mocked. Design a persistence mechanism where:
-    // - Recently used rule files/folders are saved to a config file (e.g., JSON)
-    // - Compiled rules could be cached in a GView app folder for faster loading
-    // - Track metadata: path, isFolder, lastUsed timestamp, maybe hash for change detection
-    // - Load on dialog open, save after successful scan
-
     recentlyUsedList.clear();
 
-    // MOCK DATA for demonstration. Please remove this once you have a proper persistence mechanism.
-    time_t now = time(nullptr);
-    recentlyUsedList.push_back({
-          "C:\\Users\\demo\\yara-rules\\malware_signatures.yar",
-          false,
-          now - 2 * 3600 // 2 hours ago
-    });
-    recentlyUsedList.push_back({
-          "C:\\Users\\demo\\yara-rules\\crypto_rules",
-          true,
-          now - 48 * 3600 // 48 hours ago
-    });
-    recentlyUsedList.push_back({
-          "C:\\Users\\demo\\yara-rules\\packer_detection.yar",
-          false,
-          now - 168 * 3600 // 1 week ago
-    });
+    auto allSettings = Application::GetAppSettings();
+    std::filesystem::path recentRulesPath;
+
+    if (allSettings->HasSection("Generic.Yara")) {
+        auto yaraSettings = allSettings->GetSection("Generic.Yara");
+        auto pathSetting = yaraSettings["RecentRulesPath"];
+        if (pathSetting.HasValue()) {
+            recentRulesPath = pathSetting.AsString().value();
+        }
+    }
+
+    if (recentRulesPath.empty()) {
+        recentRulesPath = "YaraRecent.json";
+    }
+
+    if (recentRulesPath.is_relative()) {
+        auto settingsDir = std::filesystem::path(Application::GetAppSettingsFile()).parent_path();
+        recentRulesPath = settingsDir / recentRulesPath;
+    }
+
+    if (!std::filesystem::exists(recentRulesPath)) {
+        return;
+    }
+
+    std::ifstream inFile(recentRulesPath);
+    if (!inFile.is_open()) {
+        LOG_ERROR("[YARA] Failed to open recent rules file: %s", recentRulesPath.string().c_str());
+        return;
+    }
+
+    nlohmann::json root = nlohmann::json::parse(inFile, nullptr, false);
+    if (root.is_discarded() || !root.contains("recentRules") || !root["recentRules"].is_array()) {
+        LOG_ERROR("[YARA] Malformed recent rules file: %s", recentRulesPath.string().c_str());
+        return;
+    }
+
+    for (const auto& item : root["recentRules"]) {
+        if (!item.contains("path") || !item.contains("isFolder") || !item.contains("lastUsed")) {
+            continue;
+        }
+
+        RecentEntry entry;
+        entry.path = item["path"].get<std::string>();
+        entry.isFolder = item["isFolder"].get<bool>();
+        entry.lastUsed = static_cast<time_t>(item["lastUsed"].get<int64_t>());
+        recentlyUsedList.push_back(entry);
+    }
 }
 
-void YaraDialog::PersistRecentlyUsed(const std::filesystem::path& path, bool isFolder)
+void GView::GenericPlugins::Yara::YaraDialog::UpdateRecentlyUsed(const std::filesystem::path& path, bool isFolder)
 {
-    // TODO: Persist to config file (e.g., JSON in GView config directory)
-    // Currently in-memory only - lost on dialog close
-
     // Remove if already exists (will re-add at front)
     auto it = std::remove_if(recentlyUsedList.begin(), recentlyUsedList.end(), [&path](const RecentEntry& entry) { return entry.path == path; });
     recentlyUsedList.erase(it, recentlyUsedList.end());
@@ -391,6 +418,51 @@ void YaraDialog::PersistRecentlyUsed(const std::filesystem::path& path, bool isF
     if (recentlyUsedList.size() > MAX_RECENT_ENTRIES) {
         recentlyUsedList.resize(MAX_RECENT_ENTRIES);
     }
+}
+
+void YaraDialog::PersistRecentlyUsedToDisk()
+{
+    auto allSettings = Application::GetAppSettings();
+    std::filesystem::path recentRulesPath;
+
+    if (allSettings->HasSection("Generic.Yara")) {
+        auto yaraSettings = allSettings->GetSection("Generic.Yara");
+        auto pathSetting = yaraSettings["RecentRulesPath"];
+        if (pathSetting.HasValue()) {
+            recentRulesPath = pathSetting.AsString().value();
+        }
+    }
+
+    if (recentRulesPath.empty()) {
+        recentRulesPath = "YaraRecent.json";
+    }
+
+    // Resolve relative paths against settings directory
+    if (recentRulesPath.is_relative()) {
+        auto settingsDir = std::filesystem::path(Application::GetAppSettingsFile()).parent_path();
+        recentRulesPath = settingsDir / recentRulesPath;
+    }
+
+    nlohmann::json jsonArray = nlohmann::json::array();
+    for (const auto& entry : recentlyUsedList) {
+        nlohmann::json obj;
+        obj["path"] = entry.path.string();
+        obj["isFolder"] = entry.isFolder;
+        obj["lastUsed"] = static_cast<int64_t>(entry.lastUsed);
+        jsonArray.push_back(obj);
+    }
+
+    nlohmann::json root;
+    root["recentRules"] = jsonArray;
+
+    std::ofstream outFile(recentRulesPath);
+    if (!outFile.is_open()) {
+        LOG_ERROR("[YARA] Failed to open file for writing: %s", recentRulesPath.string().c_str());
+        return;
+    }
+
+    outFile << root.dump(2); // Pretty print with 2-space indent
+    outFile.close();
 }
 
 // ============================================================================
@@ -542,7 +614,7 @@ void YaraDialog::ScanWithYara()
 
     // Save all used rules to recently used only after successful scan
     for (const auto& ruleFile : ruleFiles) {
-        PersistRecentlyUsed(ruleFile, false);
+        UpdateRecentlyUsed(ruleFile, false);
     }
 
     if (callbackData.matches.empty()) {
@@ -551,11 +623,38 @@ void YaraDialog::ScanWithYara()
     }
 
     std::string csv = FormatResultsAsCsv(callbackData);
-    BufferView resultView(csv.data(), static_cast<uint32>(csv.size()));
-    AppCUI::Utils::String filename("yara_results.csv");
-    GView::App::OpenBuffer(resultView, filename, filename, GView::App::OpenMethod::FirstMatch, "csv");
 
-    Exit();
+    // Generate timestamped filename
+    time_t now = time(nullptr);
+    std::tm tm{};
+    localtime_s(&tm, &now);
+    char timestamp[20];
+    std::strftime(timestamp, sizeof(timestamp), "%Y%m%d_%H%M%S", &tm);
+    std::string csvFilename = "yara_results_" + std::string(timestamp) + ".csv";
+
+    // GView exporting is bugged when opening the csv as a buffer, so just create the file and open it after.
+    auto outputPath = scanTarget.parent_path() / csvFilename;
+    std::ofstream outFile(outputPath);
+    if (outFile.is_open()) {
+        outFile << csv;
+        outFile.close();
+
+        GView::App::OpenFile(outputPath, GView::App::OpenMethod::FirstMatch, "csv");
+    } 
+    else {
+        AppCUI::Dialogs::MessageBox::ShowError("Yara", "Failed to save results to CSV file");
+    }
+
+    ExitDialog(true);
+}
+
+void YaraDialog::ExitDialog(bool persistRecentlyUsed, Dialogs::Result dialogResult)
+{
+    if (persistRecentlyUsed == true) {
+        PersistRecentlyUsedToDisk();
+    }
+
+    Exit(dialogResult);
 }
 
 } // namespace GView::GenericPlugins::Yara
