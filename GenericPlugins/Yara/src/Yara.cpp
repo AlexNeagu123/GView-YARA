@@ -1,5 +1,7 @@
 #include "Yara.hpp"
 #include "yara.h"
+#include <nlohmann/json.hpp>
+#include <fstream>
 #undef MessageBox
 
 namespace GView::GenericPlugins::Yara
@@ -160,8 +162,6 @@ YaraDialog::YaraDialog(Reference<GView::Object> object, ScanContext ctx, const s
 {
     this->object = object;
 
-    RestoreRecentlyUsed();
-
     if (context == ScanContext::SingleFile) {
         Factory::Label::Create(this, "Scanning file:", "x:1,y:1,w:14");
         Factory::TextField::Create(this, scanTarget.u16string(), "x:16,y:1,w:62", TextFieldFlags::Readonly);
@@ -212,7 +212,7 @@ void YaraDialog::OnButtonPressed(Reference<Button> b)
         ScanWithYara();
         break;
     case CMD_BUTTON_CLOSE:
-        Exit();
+        ExitDialog(true);
         break;
     }
 }
@@ -273,6 +273,12 @@ void YaraDialog::AddRuleFolder()
 
 void YaraDialog::AddRecentRules()
 {
+    if (!restoredCachedRecentRules)
+    {
+        RestoreRecentlyUsed();
+        restoredCachedRecentRules = true;
+    }
+
     if (recentlyUsedList.empty()) {
         AppCUI::Dialogs::MessageBox::ShowNotification("Yara", "No recently used rules found.");
         return;
@@ -349,38 +355,59 @@ void YaraDialog::UpdateRulesListView()
 
 void YaraDialog::RestoreRecentlyUsed()
 {
-    // TODO: Currently mocked. Design a persistence mechanism where:
-    // - Recently used rule files/folders are saved to a config file (e.g., JSON)
-    // - Compiled rules could be cached in a GView app folder for faster loading
-    // - Track metadata: path, isFolder, lastUsed timestamp, maybe hash for change detection
-    // - Load on dialog open, save after successful scan
-
     recentlyUsedList.clear();
 
-    // MOCK DATA for demonstration. Please remove this once you have a proper persistence mechanism.
-    time_t now = time(nullptr);
-    recentlyUsedList.push_back({
-          "C:\\Users\\demo\\yara-rules\\malware_signatures.yar",
-          false,
-          now - 2 * 3600 // 2 hours ago
-    });
-    recentlyUsedList.push_back({
-          "C:\\Users\\demo\\yara-rules\\crypto_rules",
-          true,
-          now - 48 * 3600 // 48 hours ago
-    });
-    recentlyUsedList.push_back({
-          "C:\\Users\\demo\\yara-rules\\packer_detection.yar",
-          false,
-          now - 168 * 3600 // 1 week ago
-    });
+    auto allSettings = Application::GetAppSettings();
+    std::filesystem::path recentRulesPath;
+
+    if (allSettings->HasSection("Generic.Yara")) {
+        auto yaraSettings = allSettings->GetSection("Generic.Yara");
+        auto pathSetting = yaraSettings["RecentRulesPath"];
+        if (pathSetting.HasValue()) {
+            recentRulesPath = pathSetting.AsString().value();
+        }
+    }
+
+    if (recentRulesPath.empty()) {
+        recentRulesPath = "YaraRecent.json";
+    }
+
+    if (recentRulesPath.is_relative()) {
+        auto settingsDir = std::filesystem::path(Application::GetAppSettingsFile()).parent_path();
+        recentRulesPath = settingsDir / recentRulesPath;
+    }
+
+    if (!std::filesystem::exists(recentRulesPath)) {
+        return;
+    }
+
+    std::ifstream inFile(recentRulesPath);
+    if (!inFile.is_open()) {
+        LOG_ERROR("[YARA] Failed to open recent rules file: %s", recentRulesPath.string().c_str());
+        return;
+    }
+
+    nlohmann::json root = nlohmann::json::parse(inFile, nullptr, false);
+    if (root.is_discarded() || !root.contains("recentRules") || !root["recentRules"].is_array()) {
+        LOG_ERROR("[YARA] Malformed recent rules file: %s", recentRulesPath.string().c_str());
+        return;
+    }
+
+    for (const auto& item : root["recentRules"]) {
+        if (!item.contains("path") || !item.contains("isFolder") || !item.contains("lastUsed")) {
+            continue;
+        }
+
+        RecentEntry entry;
+        entry.path = item["path"].get<std::string>();
+        entry.isFolder = item["isFolder"].get<bool>();
+        entry.lastUsed = static_cast<time_t>(item["lastUsed"].get<int64_t>());
+        recentlyUsedList.push_back(entry);
+    }
 }
 
-void YaraDialog::PersistRecentlyUsed(const std::filesystem::path& path, bool isFolder)
+void GView::GenericPlugins::Yara::YaraDialog::UpdateRecentlyUsed(const std::filesystem::path& path, bool isFolder)
 {
-    // TODO: Persist to config file (e.g., JSON in GView config directory)
-    // Currently in-memory only - lost on dialog close
-
     // Remove if already exists (will re-add at front)
     auto it = std::remove_if(recentlyUsedList.begin(), recentlyUsedList.end(), [&path](const RecentEntry& entry) { return entry.path == path; });
     recentlyUsedList.erase(it, recentlyUsedList.end());
@@ -391,6 +418,51 @@ void YaraDialog::PersistRecentlyUsed(const std::filesystem::path& path, bool isF
     if (recentlyUsedList.size() > MAX_RECENT_ENTRIES) {
         recentlyUsedList.resize(MAX_RECENT_ENTRIES);
     }
+}
+
+void YaraDialog::PersistRecentlyUsedToDisk()
+{
+    auto allSettings = Application::GetAppSettings();
+    std::filesystem::path recentRulesPath;
+
+    if (allSettings->HasSection("Generic.Yara")) {
+        auto yaraSettings = allSettings->GetSection("Generic.Yara");
+        auto pathSetting = yaraSettings["RecentRulesPath"];
+        if (pathSetting.HasValue()) {
+            recentRulesPath = pathSetting.AsString().value();
+        }
+    }
+
+    if (recentRulesPath.empty()) {
+        recentRulesPath = "YaraRecent.json";
+    }
+
+    // Resolve relative paths against settings directory
+    if (recentRulesPath.is_relative()) {
+        auto settingsDir = std::filesystem::path(Application::GetAppSettingsFile()).parent_path();
+        recentRulesPath = settingsDir / recentRulesPath;
+    }
+
+    nlohmann::json jsonArray = nlohmann::json::array();
+    for (const auto& entry : recentlyUsedList) {
+        nlohmann::json obj;
+        obj["path"] = entry.path.string();
+        obj["isFolder"] = entry.isFolder;
+        obj["lastUsed"] = static_cast<int64_t>(entry.lastUsed);
+        jsonArray.push_back(obj);
+    }
+
+    nlohmann::json root;
+    root["recentRules"] = jsonArray;
+
+    std::ofstream outFile(recentRulesPath);
+    if (!outFile.is_open()) {
+        LOG_ERROR("[YARA] Failed to open file for writing: %s", recentRulesPath.string().c_str());
+        return;
+    }
+
+    outFile << root.dump(2); // Pretty print with 2-space indent
+    outFile.close();
 }
 
 // ============================================================================
@@ -438,22 +510,25 @@ static std::string EscapeCsvField(const std::string& field)
     return escaped;
 }
 
-static std::string FormatResultsAsCsv(const ScanCallbackData& data)
+static std::string FormatResultsAsCsv(const vector<ScanCallbackData>& dataVec)
 {
     std::string csv = "File,Rule,StringID,MatchValue,Offset,Length\n";
 
-    for (const auto& match : data.matches) {
-        csv += EscapeCsvField(data.fileName) + ",";
-        csv += EscapeCsvField(match.ruleName) + ",";
-        csv += EscapeCsvField(match.stringId) + ",";
-        csv += EscapeCsvField(match.matchValue) + ",";
+    for (const auto& data : dataVec) {
+    
+        for (const auto& match : data.matches) {
+            csv += EscapeCsvField(data.fileName) + ",";
+            csv += EscapeCsvField(match.ruleName) + ",";
+            csv += EscapeCsvField(match.stringId) + ",";
+            csv += EscapeCsvField(match.matchValue) + ",";
 
-        char offsetBuf[32];
-        snprintf(offsetBuf, sizeof(offsetBuf), "0x%llX", (unsigned long long) match.offset);
-        csv += offsetBuf;
-        csv += ",";
+            char offsetBuf[32];
+            snprintf(offsetBuf, sizeof(offsetBuf), "0x%llX", (unsigned long long) match.offset);
+            csv += offsetBuf;
+            csv += ",";
 
-        csv += std::to_string(match.length) + "\n";
+            csv += std::to_string(match.length) + "\n";
+        }
     }
 
     return csv;
@@ -461,8 +536,10 @@ static std::string FormatResultsAsCsv(const ScanCallbackData& data)
 
 static int ScanCallback(void* context, int message, void* message_data, void* user_data)
 {
-    ScanCallbackData* callbackData = static_cast<ScanCallbackData*>(user_data);
-    if (!callbackData) {
+    vector<ScanCallbackData>* callbackDataVec = static_cast<vector<ScanCallbackData>*>(user_data);
+    ScanCallbackData* callbackData             = &callbackDataVec->back();
+
+    if (!callbackDataVec) {
         return CALLBACK_CONTINUE;
     }
 
@@ -528,34 +605,71 @@ void YaraDialog::ScanWithYara()
 
     auto yaraRules = yaraCompiler->GetRules();
 
-    ScanCallbackData callbackData;
-    callbackData.fileName = scanTarget.filename().string();
+    vector<ScanCallbackData> callbackDataVec;
+    GView::Yara::YaraScanner yaraScanner(yaraRules, ScanCallback, &callbackDataVec);
 
     if (context == ScanContext::SingleFile) {
-        GView::Yara::YaraScanner yaraScanner(yaraRules, ScanCallback, &callbackData);
+        ScanCallbackData callbackData;
+        callbackData.fileName = scanTarget.filename().string();
+        callbackDataVec.push_back(callbackData);
+
         yaraScanner.ScanBuffer(object->GetData().GetEntireFile());
     } else {
-        // TODO: Scan folder recursively - iterate files, scan each, collect results
-        AppCUI::Dialogs::MessageBox::ShowNotification("Yara", "Folder scanning - Not yet implemented");
-        return;
+        for (const auto& entry : std::filesystem::recursive_directory_iterator(scanTarget)) {
+            if (!entry.is_regular_file()) {
+                continue;
+            }
+
+            ScanCallbackData callbackData;
+            std::filesystem::path entryPath(entry.path().string());
+
+            callbackData.fileName = entryPath.filename().string();
+            callbackDataVec.push_back(callbackData);
+
+            yaraScanner.ScanFile(entryPath);
+        }
     }
 
     // Save all used rules to recently used only after successful scan
     for (const auto& ruleFile : ruleFiles) {
-        PersistRecentlyUsed(ruleFile, false);
+        UpdateRecentlyUsed(ruleFile, false);
     }
 
-    if (callbackData.matches.empty()) {
-        AppCUI::Dialogs::MessageBox::ShowNotification("Yara", "Scan completed! No matches found.");
-        return;
+    AppCUI::Dialogs::MessageBox::ShowNotification("Yara", "Scan completed!");
+
+    std::string csv = FormatResultsAsCsv(callbackDataVec);
+
+    // Generate timestamped filename
+    time_t now = time(nullptr);
+    std::tm tm{};
+    localtime_s(&tm, &now);
+    char timestamp[20];
+    std::strftime(timestamp, sizeof(timestamp), "%Y%m%d_%H%M%S", &tm);
+    std::string csvFilename = "yara_results_" + std::string(timestamp) + ".csv";
+
+    // GView exporting is bugged when opening the csv as a buffer, so just create the file and open it after.
+    auto outputPath = scanTarget.parent_path() / csvFilename;
+    std::ofstream outFile(outputPath);
+    if (outFile.is_open()) {
+        outFile << csv;
+        outFile.close();
+
+        GView::App::OpenFile(outputPath, GView::App::OpenMethod::FirstMatch, "csv");
+    } 
+    else {
+        AppCUI::Dialogs::MessageBox::ShowError("Yara", "Failed to save results to CSV file");
     }
 
-    std::string csv = FormatResultsAsCsv(callbackData);
-    BufferView resultView(csv.data(), static_cast<uint32>(csv.size()));
-    AppCUI::Utils::String filename("yara_results.csv");
-    GView::App::OpenBuffer(resultView, filename, filename, GView::App::OpenMethod::FirstMatch, "csv");
+    ExitDialog(true);
+}
 
-    Exit();
+void YaraDialog::ExitDialog(bool persistRecentlyUsed, Dialogs::Result dialogResult)
+{
+    if (persistRecentlyUsed == true) {
+        PersistRecentlyUsedToDisk();
+    }
+
+    Exit(dialogResult);
 }
 
 } // namespace GView::GenericPlugins::Yara
