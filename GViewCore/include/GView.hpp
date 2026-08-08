@@ -949,10 +949,30 @@ namespace Entropy
 
 namespace Yara
 {
-    using YaraScanCallback = int (*)(void* context, int message, void* message_data, void* user_data);
-
     class CORE_EXPORT YaraManager;
     class CORE_EXPORT YaraCompiler;
+    class CORE_EXPORT YaraScanner;
+
+    struct YaraMatch {
+        std::string_view rule;
+        std::string_view ns;
+        std::string_view identifier;
+        uint64 offset;
+        uint32 length;
+        BufferView data;
+    };
+
+    using YaraMatchCallback = void (*)(const YaraMatch& match, void* userData);
+
+    struct YaraCompilerError {
+        std::string_view message;
+        std::string_view file;
+        std::string_view rule;
+        int line;
+        bool isWarning;
+    };
+
+    using YaraCompilerCallback = void (*)(const YaraCompilerError& error, void* userData);
 
     class CORE_EXPORT YaraRules
     {
@@ -961,28 +981,31 @@ namespace Yara
         YaraRules(void* rules) : rules(rules)
         {
         }
+
+        void* Handle() const; // raw YR_RULES*
+
       public:
         ~YaraRules();
 
         YaraRules(const YaraRules&)            = delete;
         YaraRules& operator=(const YaraRules&) = delete;
 
-        YaraRules(YaraRules&& other) noexcept;
-        YaraRules& operator=(YaraRules&& other) noexcept;
-
-        void* GetRules() const;
-        bool SaveRulesToFile(const std::filesystem::path& filePath);
+        bool SaveToFile(const std::filesystem::path& filePath) const;
 
         friend class YaraManager;
         friend class YaraCompiler;
+        friend class YaraScanner;
     };
 
     class CORE_EXPORT YaraScanner
     {
       private:
         void* scanner{ nullptr }; // YR_SCANNER*
+        // The YR_SCANNER does not make a copy of the rules
+        // so, we need to keep the pointer alive
+        std::shared_ptr<YaraRules> rules;
       public:
-        YaraScanner(std::shared_ptr<YaraRules> rules, YaraScanCallback callback, void* user_data = nullptr);
+        explicit YaraScanner(std::shared_ptr<YaraRules> rules);
         ~YaraScanner();
 
         YaraScanner(const YaraScanner&)            = delete;
@@ -991,8 +1014,13 @@ namespace Yara
         YaraScanner(YaraScanner&& other) noexcept;
         YaraScanner& operator=(YaraScanner&& other) noexcept;
 
-        bool ScanFile(const std::filesystem::path& filePath);
-        bool ScanBuffer(const BufferView& buffer);
+        bool IsValid() const
+        {
+            return scanner != nullptr;
+        }
+
+        bool ScanFile(const std::filesystem::path& filePath, YaraMatchCallback onMatch, void* userData = nullptr);
+        bool ScanBuffer(const BufferView& buffer, YaraMatchCallback onMatch, void* userData = nullptr);
     };
 
     class CORE_EXPORT YaraCompiler
@@ -1002,6 +1030,8 @@ namespace Yara
 
         void* compiler{ nullptr }; // YR_COMPILER*
         CompilerStatus status{ CompilerStatus::Initial };
+        std::shared_ptr<YaraRules> compiledRules;
+
         YaraCompiler();
 
       public:
@@ -1010,15 +1040,10 @@ namespace Yara
         YaraCompiler(const YaraCompiler&)            = delete;
         YaraCompiler& operator=(const YaraCompiler&) = delete;
 
-        YaraCompiler(YaraCompiler&& other) noexcept;
-        YaraCompiler& operator=(YaraCompiler&& other) noexcept;
+        bool AddRules(const std::filesystem::path& filePath, const std::string& nameSpace = {}, YaraCompilerCallback onError = nullptr, void* userData = nullptr);
 
-        bool AddRules(const std::filesystem::path& filePath);
-        std::shared_ptr<YaraRules> GetRules();
-        bool IsCompiled() const
-        {
-            return status == CompilerStatus::Compiled;
-        }
+        std::shared_ptr<YaraRules> Compile();
+
         friend class YaraManager;
     };
 
