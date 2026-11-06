@@ -1,5 +1,4 @@
 #include "Yara.hpp"
-#include "yara.h"
 #include <nlohmann/json.hpp>
 #include <fstream>
 #undef MessageBox
@@ -516,6 +515,7 @@ static constexpr size_t MAX_MATCH_DISPLAY_LENGTH = 32;
 
 struct ScanMatch {
     std::string ruleName;
+    std::string ruleFile;
     std::string stringId;
     std::string matchValue;
     uint64_t offset;
@@ -555,15 +555,21 @@ static std::string EscapeCsvField(const std::string& field)
 
 static std::string FormatResultsAsCsv(const vector<ScanCallbackData>& dataVec)
 {
-    std::string csv = "File,Rule,StringID,MatchValue,Offset,Length\n";
+    std::string csv = "File,Rule,RuleFile,StringID,MatchValue,Offset,Length\n";
 
     for (const auto& data : dataVec) {
     
         for (const auto& match : data.matches) {
             csv += EscapeCsvField(data.fileName) + ",";
             csv += EscapeCsvField(match.ruleName) + ",";
+            csv += EscapeCsvField(match.ruleFile) + ",";
             csv += EscapeCsvField(match.stringId) + ",";
             csv += EscapeCsvField(match.matchValue) + ",";
+
+            if (match.stringId.empty()) { // rule matched without a string hit
+                csv += ",\n";
+                continue;
+            }
 
             char offsetBuf[32];
             snprintf(offsetBuf, sizeof(offsetBuf), "0x%llX", (unsigned long long) match.offset);
@@ -577,52 +583,28 @@ static std::string FormatResultsAsCsv(const vector<ScanCallbackData>& dataVec)
     return csv;
 }
 
-static int ScanCallback(void* context, int message, void* message_data, void* user_data)
+static void RecordMatch(const GView::Yara::YaraMatch& m, void* userData)
 {
-    vector<ScanCallbackData>* callbackDataVec = static_cast<vector<ScanCallbackData>*>(user_data);
-    ScanCallbackData* callbackData             = &callbackDataVec->back();
+    auto& out = *static_cast<std::vector<ScanMatch>*>(userData);
 
-    if (!callbackDataVec) {
-        return CALLBACK_CONTINUE;
+    ScanMatch scanMatch;
+    scanMatch.ruleName = std::string(m.rule);
+    scanMatch.ruleFile = std::string(m.ns);
+    scanMatch.stringId = std::string(m.identifier);
+    scanMatch.offset   = m.offset;
+    scanMatch.length   = m.length;
+
+    const size_t dataLen      = m.data.GetLength();
+    const size_t truncatedLen = dataLen < MAX_MATCH_DISPLAY_LENGTH ? dataLen : MAX_MATCH_DISPLAY_LENGTH;
+    for (size_t i = 0; i < truncatedLen; i++) {
+        char c = static_cast<char>(m.data[i]);
+        scanMatch.matchValue += (c >= 32 && c < 127) ? c : '.';
+    }
+    if (dataLen > MAX_MATCH_DISPLAY_LENGTH) {
+        scanMatch.matchValue += "...";
     }
 
-    if (message != CALLBACK_MSG_RULE_MATCHING) {
-        return CALLBACK_CONTINUE;
-    }
-
-    YR_SCAN_CONTEXT* scanContext = static_cast<YR_SCAN_CONTEXT*>(context);
-    YR_RULE* rule                = static_cast<YR_RULE*>(message_data);
-
-    YR_STRING* string;
-    yr_rule_strings_foreach(rule, string)
-    {
-        YR_MATCH* match;
-        yr_string_matches_foreach(scanContext, string, match)
-        {
-            ScanMatch scanMatch;
-            scanMatch.ruleName = rule->identifier;
-            scanMatch.stringId = string->identifier;
-            scanMatch.offset   = match->offset;
-            scanMatch.length   = match->data_length;
-
-            const uint8_t* data = match->data;
-            size_t dataLen      = static_cast<size_t>(match->data_length);
-            size_t truncatedLen = dataLen < MAX_MATCH_DISPLAY_LENGTH ? dataLen : MAX_MATCH_DISPLAY_LENGTH;
-
-            for (size_t i = 0; i < truncatedLen; i++) {
-                char c = static_cast<char>(data[i]);
-                scanMatch.matchValue += (c >= 32 && c < 127) ? c : '.';
-            }
-
-            if (dataLen > MAX_MATCH_DISPLAY_LENGTH) {
-                scanMatch.matchValue += "...";
-            }
-
-            callbackData->matches.push_back(scanMatch);
-        }
-    }
-
-    return CALLBACK_CONTINUE;
+    out.push_back(std::move(scanMatch));
 }
 
 void YaraDialog::ScanWithYara()
@@ -647,7 +629,7 @@ void YaraDialog::ScanWithYara()
     for (const auto& ruleFile : ruleFiles) {
         auto validator = yaraManager.GetNewCompiler();
         if (validator->AddRules(ruleFile)) {
-            if (yaraCompiler->AddRules(ruleFile)) {
+            if (yaraCompiler->AddRules(ruleFile, ruleFile.string())) {
                 successCount++;
             } else {
                 compilationErrors += ruleFile.filename().string() + " (Unknown Error)\n";
@@ -670,7 +652,7 @@ void YaraDialog::ScanWithYara()
         }
     }
 
-    auto yaraRules = yaraCompiler->GetRules();
+    auto yaraRules = yaraCompiler->Compile();
 
     if (!yaraRules) {
         AppCUI::Dialogs::MessageBox::ShowError("Error", "Critical: YARA compiler refused to generate rules due to previous errors.\nCannot proceed with scanning.");
@@ -678,14 +660,15 @@ void YaraDialog::ScanWithYara()
     }
 
     vector<ScanCallbackData> callbackDataVec;
-    GView::Yara::YaraScanner yaraScanner(yaraRules, ScanCallback, &callbackDataVec);
+    GView::Yara::YaraScanner yaraScanner(yaraRules);
 
     if (context == ScanContext::SingleFile) {
         ScanCallbackData callbackData;
         callbackData.fileName = scanTarget.filename().string();
-        callbackDataVec.push_back(callbackData);
+        callbackDataVec.push_back(std::move(callbackData));
+        auto& matches = callbackDataVec.back().matches;
 
-        yaraScanner.ScanBuffer(object->GetData().GetEntireFile());
+        yaraScanner.ScanBuffer(object->GetData().GetEntireFile(), RecordMatch, &matches);
     } else {
         for (const auto& entry : std::filesystem::recursive_directory_iterator(scanTarget)) {
             if (!entry.is_regular_file()) {
@@ -695,10 +678,11 @@ void YaraDialog::ScanWithYara()
             ScanCallbackData callbackData;
             std::filesystem::path entryPath(entry.path().string());
 
-            callbackData.fileName = entryPath.filename().string();
-            callbackDataVec.push_back(callbackData);
+            callbackData.fileName = entryPath.lexically_relative(scanTarget).string();
+            callbackDataVec.push_back(std::move(callbackData));
+            auto& matches = callbackDataVec.back().matches;
 
-            yaraScanner.ScanFile(entryPath);
+            yaraScanner.ScanFile(entryPath, RecordMatch, &matches);
         }
     }
 
